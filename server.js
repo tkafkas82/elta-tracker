@@ -206,49 +206,108 @@ function page(value, contentHtml) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ELTA Tracker</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0a6cff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="ELTA Tracker">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230a6cff' rx='20'/><path d='M20 40 L50 65 L80 40' fill='none' stroke='white' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'/><rect x='20' y='40' width='60' height='45' fill='none' stroke='white' stroke-width='8'/></svg>" type="image/svg+xml">
   <style>
-    :root { --blue:#0a6cff; --grey:#666; --line:#e3e3e3; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color:#1c1c1c; }
+    :root { --blue:#0a6cff; --grey:#666; --line:#e3e3e3; --bg:#fff; --card-bg:#fff; --text:#1c1c1c; --input-bg:#fff; --input-border:#ccc; --pre-bg:#f6f6f6; }
+    [data-theme="dark"] { --line:#333; --bg:#0f1115; --card-bg:#1a1d23; --text:#e6e6e6; --grey:#aaa; --input-bg:#1a1d23; --input-border:#333; --pre-bg:#15171c; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color:var(--text); background:var(--bg); }
     h1 { font-size:1.4rem; margin-bottom:.2rem; }
     .sub { color: var(--grey); margin: 0 0 1.2rem; font-size:.9rem; }
     form { display:flex; gap:.5rem; margin:1rem 0; }
-    input { flex:1; padding:.6rem .7rem; border:1px solid #ccc; border-radius:8px; font-size:1rem; }
+    input { flex:1; padding:.6rem .7rem; border:1px solid var(--input-border); border-radius:8px; font-size:1rem; background:var(--input-bg); color:var(--text); }
     button { padding:.6rem 1.1rem; border:0; border-radius:8px; background: var(--blue); color:#fff; font-weight:600; cursor:pointer; }
     button:hover { filter:brightness(.95); }
-    .card { border:1px solid var(--line); border-radius:12px; padding:1rem 1.1rem; margin:.9rem 0; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+    .card { border:1px solid var(--line); border-radius:12px; padding:1rem 1.1rem; margin:.9rem 0; box-shadow:0 1px 2px rgba(0,0,0,.04); background:var(--card-bg); }
     .card-head { display:flex; align-items:center; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
     .code { font-family:ui-monospace,monospace; font-weight:600; }
     .badge { font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; padding:.2rem .5rem; border-radius:999px; background:#eee; color:#444; font-weight:700; }
+    [data-theme="dark"] .badge { background:#2a2d35; color:#d1d5db; }
     .badge.elta { background:#e7f0ff; color:#0a6cff; }
+    [data-theme="dark"] .badge.elta { background:#0f1f40; color:#93bfff; }
     .badge.cy { background:#fff0e6; color:#d97706; }
+    [data-theme="dark"] .badge.cy { background:#3b2718; color:#f5b97a; }
     .badge.done { background:#e6f7ec; color:#12924a; }
+    [data-theme="dark"] .badge.done { background:#122e1f; color:#6ee7a5; }
     .timeline { list-style:none; margin:0; padding:0 0 0 .2rem; }
     .timeline li { position:relative; padding:0 0 1rem 1.4rem; border-left:2px solid var(--line); }
     .timeline li:last-child { border-left-color:transparent; padding-bottom:0; }
-    .timeline .dot { position:absolute; left:-7px; top:2px; width:12px; height:12px; border-radius:50%; background:#bbb; border:2px solid #fff; }
+    .timeline .dot { position:absolute; left:-7px; top:2px; width:12px; height:12px; border-radius:50%; background:#bbb; border:2px solid var(--card-bg); }
     .timeline li.current .dot { background:var(--blue); }
     .timeline .status { font-weight:600; }
     .timeline .meta { color:var(--grey); font-size:.85rem; margin-top:.1rem; }
     .cy-note { margin-top:.6rem; font-size:.85rem; color:#d97706; background:#fff7ed; padding:.5rem .7rem; border-radius:8px; }
-    pre { background:#f6f6f6; padding:.9rem; border-radius:8px; overflow:auto; font-size:.82rem; }
+    [data-theme="dark"] .cy-note { background:#3b2718; color:#f5b97a; }
+    pre { background:var(--pre-bg); padding:.9rem; border-radius:8px; overflow:auto; font-size:.82rem; color:var(--text); }
     .error { color:#c0392b; }
     .section-title { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--grey); margin:1.2rem 0 .3rem; }
+    .theme-toggle { margin-left:auto; background:transparent; border:1px solid var(--line); color:var(--text); padding:.35rem .6rem; border-radius:8px; font-size:.85rem; }
   </style>
 </head>
 <body>
-  <h1>ELTA Package Tracker</h1>
+  <div style="display:flex;align-items:center;gap:.5rem;">
+    <h1>ELTA Package Tracker</h1>
+    <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle dark mode">🌙</button>
+  </div>
   <p class="sub">Track Greek parcels via ELTA. When delivered in Greece, continue with the Cyprus (CY) service.</p>
   <form method="get">
     <input name="code" placeholder="Tracking code (e.g. RE574578316GR)" value="${esc(value)}">
     <button type="submit">Track</button>
   </form>
   ${contentHtml}
+  <script>
+    const themeToggle = document.getElementById('themeToggle');
+    const root = document.documentElement;
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', 'dark');
+    if (themeToggle) {
+      themeToggle.textContent = root.getAttribute('data-theme') === 'dark' ? '☀️' : '🌙';
+      themeToggle.addEventListener('click', () => {
+        const isDark = root.getAttribute('data-theme') === 'dark';
+        if (isDark) root.removeAttribute('data-theme'); else root.setAttribute('data-theme', 'dark');
+        themeToggle.textContent = isDark ? '🌙' : '☀️';
+        localStorage.setItem('theme', isDark ? 'light' : 'dark');
+      });
+    }
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  </script>
 </body>
 </html>`;
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  if (pathname === '/manifest.json') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      name: 'ELTA Package Tracker',
+      short_name: 'ELTA Tracker',
+      start_url: '/',
+      display: 'standalone',
+      background_color: '#0f1115',
+      theme_color: '#0a6cff',
+      icons: [
+        { src: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="%230a6cff" rx="20"/><path d="M20 40 L50 65 L80 40" fill="none" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/><rect x="20" y="40" width="60" height="45" fill="none" stroke="white" stroke-width="8"/></svg>', sizes: '192x192', type: 'image/svg+xml' },
+        { src: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="%230a6cff" rx="20"/><path d="M20 40 L50 65 L80 40" fill="none" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/><rect x="20" y="40" width="60" height="45" fill="none" stroke="white" stroke-width="8"/></svg>', sizes: '512x512', type: 'image/svg+xml' }
+      ]
+    }));
+    return;
+  }
+
+  if (pathname === '/sw.js') {
+    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+    res.end("self.addEventListener('install', e => self.skipWaiting()); self.addEventListener('activate', e => e.waitUntil(self.clients.claim())); self.addEventListener('fetch', event => { event.respondWith(fetch(event.request).catch(() => new Response('Offline'))); });");
+    return;
+  }
+
   const code = (url.searchParams.get('code') || '').trim();
 
   if (!code) {
