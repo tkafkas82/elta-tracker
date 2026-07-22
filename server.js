@@ -257,7 +257,10 @@ function cyLatest(parsed) {
 function pickLatest(a, b) {
   if (!a) return b || null;
   if (!b) return a;
-  return b.key > a.key ? b : a; // prefer the more recent timestamp
+  if (b.key !== a.key) return b.key > a.key ? b : a; // more recent timestamp wins
+  // Same timestamp (e.g. the shared Athens airport handoff): prefer the CY
+  // leg — it is the more advanced, downstream status.
+  return b.source === 'CY' ? b : a.source === 'CY' ? a : b;
 }
 
 function renderSummary(latest) {
