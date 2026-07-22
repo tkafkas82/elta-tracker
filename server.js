@@ -5,18 +5,21 @@ const { URLSearchParams } = require('url');
 const PORT = process.env.PORT || 3000;
 const TRACK_API = 'https://www.elta.gr/trackApi';
 
-// Cyprus (CY) fallback service.
-// Cyprus Post does not expose a simple JSON API like ELTA; the tracking data
-// is server-rendered. The public results page is a signed URL of the form:
-//   https://www.cypruspost.post/en/track-n-trace-results?code=<CODE>&expires=<TS>&signature=<SIG>
-// The signature/expiry are generated per request (the link you shared expires).
-// Provide a template via env var CY_RESULTS_URL with a {code} placeholder, e.g.:
-//   https://www.cypruspost.post/en/track-n-trace-results?code={code}&expires=...&signature=...
-// If empty, the CY section shows a hint instead of failing.
+// Cyprus (CY) service.
+// Cyprus Post has no JSON API; tracking is server-rendered behind a signed,
+// expiring results URL. We reproduce what the browser does:
+//   1. GET the track page  -> CSRF _token, encrypted valid_from, honeypot
+//      field name and a session cookie.
+//   2. POST the code to /track-and-trace/find with those + cookies.
+//   3. Follow the 302 to the signed results URL (same cookies) and parse it.
+// Optionally, CY_RESULTS_URL can pin a signed link with a {code} placeholder
+// to bypass the live handshake (mostly for debugging).
 const CY_RESULTS_URL = process.env.CY_RESULTS_URL || '';
+const CY_TRACK_PAGE = 'https://www.cypruspost.post/en/track-n-trace-results';
+const CY_FIND_URL = 'https://www.cypruspost.post/track-and-trace/find';
 
 const CY_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (compatible; EltaTracker/1.0)',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml',
 };
 
@@ -52,70 +55,157 @@ function trackWithElta(code) {
   return postForm(TRACK_API, { 'code[]': code, in_lang: '1' });
 }
 
-function fetchCyResults(code) {
-  if (!CY_RESULTS_URL) {
-    return Promise.reject(new Error('CY_RESULTS_URL not configured'));
-  }
-  const url = CY_RESULTS_URL.replace(/\{code\}/g, encodeURIComponent(code));
+function httpGet(url, cookie) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: CY_HEADERS }, (res) => {
+    const headers = { ...CY_HEADERS };
+    if (cookie) headers.Cookie = cookie;
+    const req = https.get(url, { headers }, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
     });
     req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Cyprus Post request timed out')); });
   });
 }
 
+function httpPostForm(url, payload, cookie, referer) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      method: 'POST',
+      headers: {
+        ...CY_HEADERS,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload),
+        'Cookie': cookie,
+        'Origin': 'https://www.cypruspost.post',
+        'Referer': referer,
+      },
+    };
+    const req = https.request(url, options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Cyprus Post request timed out')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// Live Cyprus Post lookup (see the CY_* notes above for the handshake).
+async function fetchCyResults(code) {
+  if (CY_RESULTS_URL) {
+    const url = CY_RESULTS_URL.replace(/\{code\}/g, encodeURIComponent(code));
+    return httpGet(url, '');
+  }
+
+  const page = await httpGet(CY_TRACK_PAGE, '');
+  const tokenM = page.body.match(/name="_token" value="([^"]+)"/);
+  const vfM = page.body.match(/name="valid_from"[\s\S]*?value="([^"]+)"/);
+  const hpM = page.body.match(/id="(\w+)"\s+name="\1"\s+type="text"/);
+  if (!tokenM) throw new Error('Could not read Cyprus Post form token');
+  const cookie = (page.headers['set-cookie'] || []).map((c) => c.split(';')[0]).join('; ');
+
+  const form = new URLSearchParams();
+  if (hpM) form.append(hpM[1], '');        // honeypot must be sent empty
+  if (vfM) form.append('valid_from', vfM[1]);
+  form.append('_token', tokenM[1]);
+  form.append('code', code);
+
+  const found = await httpPostForm(CY_FIND_URL, form.toString(), cookie, CY_TRACK_PAGE);
+  const location = found.headers.location;
+  if (!location) return { status: found.status, body: found.body };
+  const resultsUrl = location.startsWith('http') ? location : `https://www.cypruspost.post${location}`;
+  return httpGet(resultsUrl, cookie);
+}
+
 // Parse the server-rendered Cyprus Post results HTML for a given code.
+// Events come as a table: Time | Country | Location | Event | Next Office | Extra.
 function parseCyHtml(html, code) {
   const startTag = `collapse_${code}`;
   const idx = html.indexOf(startTag);
   const slice = idx >= 0 ? html.slice(idx) : html;
+  // Bound the panel so we don't bleed into modals / other tracked items.
+  const endIdx = slice.indexOf('space-30');
+  const panel = endIdx >= 0 ? slice.slice(0, endIdx) : slice;
 
-  const serviceMatch = slice.match(/<h4>([\s\S]*?)<\/h4>/);
+  // Service type lives in the first <h4>, after dropping the "Options" dropdown.
   let service = '';
+  const serviceMatch = panel.match(/<h4>([\s\S]*?)<\/h4>/);
   if (serviceMatch) {
     service = serviceMatch[1]
-      .replace(/<[^>]+>/g, '')
+      .replace(/<div class="dropdown[\s\S]*?<\/div>\s*<\/div>/g, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g, '&')
       .replace(/\s+/g, ' ')
-      .replace(/Letter Post|Parcel Post|EMS.*$/i, (m) => m)
       .trim();
   }
 
-  const noInfo = /There is no information for this item/i.test(slice);
-  if (noInfo) {
+  if (/There is no information for this item/i.test(panel)) {
     return { service, events: [], noInfo: true };
   }
 
   const events = [];
-  const panelRe = /<div class="panel-body">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g;
-  const block = slice.match(/<div class="panel-body">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/);
-  if (block) {
-    const inner = block[1];
-    const rowRe = /<li[^>]*>([\s\S]*?)<\/li>/g;
-    let m;
-    while ((m = rowRe.exec(inner)) !== null) {
-      const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      if (text) events.push(text);
+  const tbody = panel.match(/<tbody>([\s\S]*?)<\/tbody>/i);
+  if (tbody) {
+    const rowRe = /<tr>([\s\S]*?)<\/tr>/gi;
+    let row;
+    while ((row = rowRe.exec(tbody[1])) !== null) {
+      const cells = [];
+      const cellRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+      let c;
+      while ((c = cellRe.exec(row[1])) !== null) {
+        cells.push(c[1].replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim());
+      }
+      if (cells.some(Boolean)) {
+        events.push({
+          time: cells[0] || '',
+          country: cells[1] || '',
+          location: cells[2] || '',
+          event: cells[3] || '',
+          nextOffice: cells[4] || '',
+          extra: cells[5] || '',
+        });
+      }
     }
   }
 
   return { service, events, noInfo: false };
 }
 
-// Inspect ELTA response. Returns a hint about whether the parcel is still
-// moving inside Greece or has reached a final status.
-function eltaFinalStatus(entry) {
-  const statuses = entry?.response?.out_status || [];
-  const filled = statuses.filter((s) => s.out_status_name && s.out_status_name.trim() !== '');
-  const last = filled[filled.length - 1];
-  if (!last) return { done: false, last };
+// Lowercase + strip Greek accents so matching is tolerant of casing/tonos.
+function norm(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
 
-  const name = last.out_status_name.toLowerCase();
-  const delivered = name.includes('παράδοση') || name.includes('παραλαβ') || name.includes('delivered') || name.includes('received');
-  const departed = name.includes('αναχώρηση') || name.includes('αποστολή') || name.includes('από ελλάδα') || name.includes('departure') || name.includes('departed');
-  return { done: delivered || departed, last };
+// When does the parcel leave ELTA for Cyprus? Once it reaches Athens Airport
+// (ΑΕΡΟΛΙΜΕΝΑΣ ΑΘΗΝΩΝ) with one of these two ELTA statuses:
+//   • "Αποστολή αντικειμένου"  (item dispatched)
+//   • "Άφιξη σε αεροδρόμιο"     (arrived at airport)
+// Either one at the airport means it is on its way to Cyprus, so we start the
+// CY track. `handedOff` is checked across all events (it stays true once the
+// airport is reached); `delivered` reflects only the latest status.
+function eltaFinalStatus(entry) {
+  const statuses = (entry?.response?.out_status || [])
+    .filter((s) => s.out_status_name && s.out_status_name.trim() !== '');
+  const last = statuses[statuses.length - 1];
+
+  const handedOff = statuses.some((s) => {
+    const name = norm(s.out_status_name);
+    const station = norm(s.out_station);
+    const atAirport = station.includes('αερολιμ') || station.includes('aerolim') || station.includes('airport');
+    const isDispatch = name.includes('αποστολη') || name.includes('dispatch');
+    const isArrival = name.includes('αφιξη') || name.includes('arriv');
+    return atAirport && (isDispatch || isArrival);
+  });
+
+  const lastName = norm(last?.out_status_name);
+  const delivered = lastName.includes('παραδοση') || lastName.includes('παραλαβ') ||
+    lastName.includes('delivered') || lastName.includes('received');
+
+  return { done: handedOff, handedOff, delivered, last };
 }
 
 function escapeHtml(s) {
@@ -146,17 +236,17 @@ function renderElta(entry) {
       </div>
     </li>`).join('');
 
-  const { done } = eltaFinalStatus(entry);
+  const { handedOff, delivered } = eltaFinalStatus(entry);
 
   return `
     <div class="card">
       <div class="card-head">
         <span class="badge elta">ELTA (GR)</span>
         <span class="code">${esc(entry.code)}</span>
-        ${done ? '<span class="badge done">Delivered</span>' : ''}
+        ${delivered ? '<span class="badge done">Delivered</span>' : ''}
       </div>
       <ol class="timeline">${rows || '<li>No tracking events yet.</li>'}</ol>
-      ${done ? `<div class="cy-note">Parcel reached a final status in Greece. Use the Cyprus (CY) tracker below to continue.</div>` : ''}
+      ${handedOff ? `<div class="cy-note">Reached Athens Airport — on its way to Cyprus. Continuing with the Cyprus (CY) tracker below.</div>` : ''}
     </div>`;
 }
 
@@ -172,11 +262,19 @@ function renderCy(parsed, code) {
       </div>`;
   }
 
-  const rows = parsed.events.map((e, i) => `
+  const rows = parsed.events.map((e, i) => {
+    const meta = [e.location, e.country, e.time].filter(Boolean).map(esc).join(' · ');
+    const extra = e.extra ? `<div class="meta">${esc(e.extra)}</div>` : '';
+    return `
     <li class="${i === parsed.events.length - 1 ? 'current' : ''}">
       <div class="dot"></div>
-      <div class="ev"><div class="status">${esc(e)}</div></div>
-    </li>`).join('');
+      <div class="ev">
+        <div class="status">${esc(e.event || '—')}</div>
+        ${meta ? `<div class="meta">${meta}</div>` : ''}
+        ${extra}
+      </div>
+    </li>`;
+  }).join('');
 
   return `
     <div class="card">
@@ -323,19 +421,15 @@ const server = http.createServer(async (req, res) => {
     const entry = Array.isArray(parsed) ? parsed[0] : parsed;
     html += renderElta(entry);
 
-    const { done } = eltaFinalStatus(entry);
-    if (done) {
+    const { handedOff } = eltaFinalStatus(entry);
+    if (handedOff) {
       html += `<div class="section-title">Continued in Cyprus</div>`;
-      if (!CY_RESULTS_URL) {
-        html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><div class="cy-note">Set CY_RESULTS_URL (signed results link with {code}) to enable Cyprus tracking.</div></div>`;
-      } else {
-        try {
-          const cy = await fetchCyResults(code);
-          const parsed = parseCyHtml(cy.body, code);
-          html += renderCy(parsed, code);
-        } catch (cyErr) {
-          html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyErr.message)}</p></div>`;
-        }
+      try {
+        const cy = await fetchCyResults(code);
+        const parsed = parseCyHtml(cy.body, code);
+        html += renderCy(parsed, code);
+      } catch (cyErr) {
+        html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyErr.message)}</p></div>`;
       }
     }
   } catch (err) {
