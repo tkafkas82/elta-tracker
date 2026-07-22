@@ -220,6 +220,60 @@ function formatDateTime(date, time) {
   return `${d}/${m}/${y}${t}`.trim();
 }
 
+// --- Latest-known-status helpers (used for the top summary banner) ---
+
+// Normalise a CY "DD/MM/YYYY HH:MM" stamp to a sortable YYYYMMDDHHMM key.
+function cyKey(timeStr) {
+  const m = String(timeStr || '').match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (!m) return '';
+  return m[3] + m[2] + m[1] + (m[4] || '00') + (m[5] || '00');
+}
+
+function eltaLatest(entry) {
+  const statuses = eltaStatuses(entry);
+  const s = statuses[statuses.length - 1];
+  if (!s) return null;
+  return {
+    source: 'ELTA', label: 'ELTA (GR)', badge: 'elta',
+    status: s.out_status_name,
+    where: s.out_station || '',
+    when: formatDateTime(s.out_date, s.out_time),
+    key: (s.out_date || '') + String(s.out_time || '').padEnd(4, '0'),
+  };
+}
+
+function cyLatest(parsed) {
+  if (!parsed || parsed.noInfo || !parsed.events.length) return null;
+  const e = parsed.events[parsed.events.length - 1];
+  return {
+    source: 'CY', label: 'Cyprus (CY)', badge: 'cy',
+    status: e.event || '—',
+    where: [e.location, e.country].filter(Boolean).join(', '),
+    when: e.time || '',
+    key: cyKey(e.time),
+  };
+}
+
+function pickLatest(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return b.key > a.key ? b : a; // prefer the more recent timestamp
+}
+
+function renderSummary(latest) {
+  if (!latest) return '';
+  const meta = [latest.where, latest.when].filter(Boolean).map(esc).join(' · ');
+  return `
+    <div class="summary">
+      <div class="summary-top">
+        <span class="summary-label">Latest status</span>
+        <span class="badge ${latest.badge}">${esc(latest.label)}</span>
+      </div>
+      <div class="summary-status">${esc(latest.status)}</div>
+      ${meta ? `<div class="summary-meta">${meta}</div>` : ''}
+    </div>`;
+}
+
 function renderElta(entry) {
   const statuses = eltaStatuses(entry);
 
@@ -233,53 +287,58 @@ function renderElta(entry) {
     </li>`).join('');
 
   const { delivered } = eltaFinalStatus(entry);
+  const hint = statuses.length ? statuses[statuses.length - 1].out_status_name : 'No events yet';
 
   return `
-    <div class="card">
-      <div class="card-head">
+    <details class="card section" open>
+      <summary class="card-head">
+        <span class="chev">▸</span>
         <span class="badge elta">ELTA (GR)</span>
         <span class="code">${esc(entry.code)}</span>
         ${delivered ? '<span class="badge done">Delivered</span>' : ''}
-      </div>
+        <span class="summary-hint">${esc(hint)}</span>
+      </summary>
       <ol class="timeline">${rows || '<li>No tracking events yet.</li>'}</ol>
-    </div>`;
+    </details>`;
 }
 
 function renderCy(parsed, code) {
+  const hasEvents = !parsed.noInfo && parsed.events.length > 0;
+  const hint = parsed.noInfo
+    ? 'No information yet'
+    : (hasEvents ? parsed.events[parsed.events.length - 1].event : 'No events listed');
+
+  let body;
   if (parsed.noInfo) {
-    return `
-      <div class="card">
-        <div class="card-head">
-          <span class="badge cy">Cyprus (CY)</span>
-          <span class="code">${esc(code)}</span>
+    body = `<div class="cy-note">No information for this item in Cyprus yet. It has likely not arrived / been scanned by Cyprus Post.</div>`;
+  } else {
+    const rows = parsed.events.map((e, i) => {
+      const meta = [e.location, e.country, e.time].filter(Boolean).map(esc).join(' · ');
+      const extra = e.extra ? `<div class="meta">${esc(e.extra)}</div>` : '';
+      return `
+      <li class="${i === parsed.events.length - 1 ? 'current' : ''}">
+        <div class="dot"></div>
+        <div class="ev">
+          <div class="status">${esc(e.event || '—')}</div>
+          ${meta ? `<div class="meta">${meta}</div>` : ''}
+          ${extra}
         </div>
-        <div class="cy-note">No information for this item in Cyprus yet. It has likely not arrived / been scanned by Cyprus Post.</div>
-      </div>`;
+      </li>`;
+    }).join('');
+    body = rows ? `<ol class="timeline">${rows}</ol>` : '<div class="cy-note">No tracking events listed.</div>';
   }
 
-  const rows = parsed.events.map((e, i) => {
-    const meta = [e.location, e.country, e.time].filter(Boolean).map(esc).join(' · ');
-    const extra = e.extra ? `<div class="meta">${esc(e.extra)}</div>` : '';
-    return `
-    <li class="${i === parsed.events.length - 1 ? 'current' : ''}">
-      <div class="dot"></div>
-      <div class="ev">
-        <div class="status">${esc(e.event || '—')}</div>
-        ${meta ? `<div class="meta">${meta}</div>` : ''}
-        ${extra}
-      </div>
-    </li>`;
-  }).join('');
-
   return `
-    <div class="card">
-      <div class="card-head">
+    <details class="card section" ${hasEvents ? 'open' : ''}>
+      <summary class="card-head">
+        <span class="chev">▸</span>
         <span class="badge cy">Cyprus (CY)</span>
         <span class="code">${esc(code)}</span>
         ${parsed.service ? `<span class="service">${esc(parsed.service)}</span>` : ''}
-      </div>
-      ${rows ? `<ol class="timeline">${rows}</ol>` : '<div class="cy-note">No tracking events listed.</div>'}
-    </div>`;
+        <span class="summary-hint">${esc(hint)}</span>
+      </summary>
+      ${body}
+    </details>`;
 }
 
 function renderRaw(label, status, body) {
@@ -317,6 +376,22 @@ function page(value, contentHtml) {
     button:hover { filter:brightness(.95); }
     .card { border:1px solid var(--line); border-radius:12px; padding:1rem 1.1rem; margin:.9rem 0; box-shadow:0 1px 2px rgba(0,0,0,.04); background:var(--card-bg); }
     .card-head { display:flex; align-items:center; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
+    /* Collapsible carrier sections */
+    details.section { padding-top:.85rem; }
+    details.section > summary { list-style:none; cursor:pointer; margin-bottom:0; user-select:none; }
+    details.section > summary::-webkit-details-marker { display:none; }
+    details.section[open] > summary { margin-bottom:.8rem; }
+    .chev { display:inline-block; transition:transform .15s ease; color:var(--grey); font-size:.9rem; }
+    details.section[open] > summary .chev { transform:rotate(90deg); }
+    .summary-hint { margin-left:auto; color:var(--grey); font-size:.85rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:45%; }
+    details.section[open] > summary .summary-hint { display:none; }
+    /* Latest-known-status banner */
+    .summary { border:1px solid var(--line); border-left:4px solid var(--blue); border-radius:12px; padding:.9rem 1.1rem; margin:.9rem 0; background:var(--card-bg); }
+    .summary-top { display:flex; align-items:center; gap:.5rem; margin-bottom:.35rem; }
+    .summary-label { font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--grey); font-weight:700; }
+    .summary-status { font-size:1.15rem; font-weight:700; }
+    .summary-meta { color:var(--grey); font-size:.88rem; margin-top:.15rem; }
+    .service { color:var(--grey); font-size:.85rem; }
     .code { font-family:ui-monospace,monospace; font-weight:600; }
     .badge { font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; padding:.2rem .5rem; border-radius:999px; background:#eee; color:#444; font-weight:700; }
     [data-theme="dark"] .badge { background:#2a2d35; color:#d1d5db; }
@@ -418,26 +493,33 @@ const server = http.createServer(async (req, res) => {
     fetchCyResults(code),
   ]);
 
-  html += `<div class="section-title">ELTA (Greece)</div>`;
+  // Build each carrier section and its latest-status candidate.
+  let eltaHtml = '', cyHtml = '', eltaLatestVal = null, cyLatestVal = null;
+
   if (eltaRes.status === 'fulfilled') {
     try {
       const parsed = JSON.parse(eltaRes.value.body);
       const entry = Array.isArray(parsed) ? parsed[0] : parsed;
-      html += renderElta(entry);
+      eltaLatestVal = eltaLatest(entry);
+      eltaHtml = renderElta(entry);
     } catch {
-      html += `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">Could not read ELTA response.</p></div>`;
+      eltaHtml = `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">Could not read ELTA response.</p></div>`;
     }
   } else {
-    html += `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">ELTA request failed: ${esc(eltaRes.reason?.message || 'unknown error')}</p></div>`;
+    eltaHtml = `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">ELTA request failed: ${esc(eltaRes.reason?.message || 'unknown error')}</p></div>`;
   }
 
-  html += `<div class="section-title">Cyprus (CY)</div>`;
   if (cyRes.status === 'fulfilled') {
     const parsed = parseCyHtml(cyRes.value.body, code);
-    html += renderCy(parsed, code);
+    cyLatestVal = cyLatest(parsed);
+    cyHtml = renderCy(parsed, code);
   } else {
-    html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
+    cyHtml = `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
   }
+
+  html += renderSummary(pickLatest(eltaLatestVal, cyLatestVal));
+  html += eltaHtml;
+  html += cyHtml;
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(page(code, html));
