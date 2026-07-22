@@ -180,32 +180,29 @@ function norm(s) {
   return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
 }
 
-// When does the parcel leave ELTA for Cyprus? Once it reaches Athens Airport
-// (ΑΕΡΟΛΙΜΕΝΑΣ ΑΘΗΝΩΝ) with one of these two ELTA statuses:
-//   • "Αποστολή αντικειμένου"  (item dispatched)
-//   • "Άφιξη σε αεροδρόμιο"     (arrived at airport)
-// Either one at the airport means it is on its way to Cyprus, so we start the
-// CY track. `handedOff` is checked across all events (it stays true once the
-// airport is reached); `delivered` reflects only the latest status.
-function eltaFinalStatus(entry) {
-  const statuses = (entry?.response?.out_status || [])
-    .filter((s) => s.out_status_name && s.out_status_name.trim() !== '');
-  const last = statuses[statuses.length - 1];
-
-  const handedOff = statuses.some((s) => {
-    const name = norm(s.out_status_name);
-    const station = norm(s.out_station);
-    const atAirport = station.includes('αερολιμ') || station.includes('aerolim') || station.includes('airport');
-    const isDispatch = name.includes('αποστολη') || name.includes('dispatch');
-    const isArrival = name.includes('αφιξη') || name.includes('arriv');
-    return atAirport && (isDispatch || isArrival);
+// ELTA returns statuses newest-first. Sort them chronologically (oldest ->
+// newest) so the timeline reads top-down and the last item is the current one.
+function eltaStatuses(entry) {
+  const arr = (entry?.response?.out_status || [])
+    .filter((s) => s.out_status_name && s.out_status_name.trim() !== '')
+    .map((s, i) => ({ s, i }));
+  arr.sort((a, b) => {
+    const ka = (a.s.out_date || '') + (a.s.out_time || '');
+    const kb = (b.s.out_date || '') + (b.s.out_time || '');
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    return b.i - a.i; // equal timestamps: reverse the newest-first source order
   });
+  return arr.map((x) => x.s);
+}
 
+// Latest status only drives the "Delivered" badge; CY is always queried now.
+function eltaFinalStatus(entry) {
+  const statuses = eltaStatuses(entry);
+  const last = statuses[statuses.length - 1];
   const lastName = norm(last?.out_status_name);
-  const delivered = lastName.includes('παραδοση') || lastName.includes('παραλαβ') ||
+  const delivered = lastName.includes('παραδο') || lastName.includes('παραλαβ') ||
     lastName.includes('delivered') || lastName.includes('received');
-
-  return { done: handedOff, handedOff, delivered, last };
+  return { delivered, last };
 }
 
 function escapeHtml(s) {
@@ -224,8 +221,7 @@ function formatDateTime(date, time) {
 }
 
 function renderElta(entry) {
-  const head = entry?.response ?? {};
-  const statuses = (head.out_status || []).filter((s) => s.out_status_name && s.out_status_name.trim() !== '');
+  const statuses = eltaStatuses(entry);
 
   const rows = statuses.map((s, i) => `
     <li class="${i === statuses.length - 1 ? 'current' : ''}">
@@ -236,7 +232,7 @@ function renderElta(entry) {
       </div>
     </li>`).join('');
 
-  const { handedOff, delivered } = eltaFinalStatus(entry);
+  const { delivered } = eltaFinalStatus(entry);
 
   return `
     <div class="card">
@@ -246,7 +242,6 @@ function renderElta(entry) {
         ${delivered ? '<span class="badge done">Delivered</span>' : ''}
       </div>
       <ol class="timeline">${rows || '<li>No tracking events yet.</li>'}</ol>
-      ${handedOff ? `<div class="cy-note">Reached Athens Airport — on its way to Cyprus. Continuing with the Cyprus (CY) tracker below.</div>` : ''}
     </div>`;
 }
 
@@ -414,26 +409,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Query both carriers in parallel and always show both. A parcel to Cyprus
+  // is tracked by ELTA inside Greece and by Cyprus Post once it arrives; for
+  // anything else the CY side simply reports "no information", which is fine.
   let html = '';
-  try {
-    const elta = await trackWithElta(code);
-    const parsed = JSON.parse(elta.body);
-    const entry = Array.isArray(parsed) ? parsed[0] : parsed;
-    html += renderElta(entry);
+  const [eltaRes, cyRes] = await Promise.allSettled([
+    trackWithElta(code),
+    fetchCyResults(code),
+  ]);
 
-    const { handedOff } = eltaFinalStatus(entry);
-    if (handedOff) {
-      html += `<div class="section-title">Continued in Cyprus</div>`;
-      try {
-        const cy = await fetchCyResults(code);
-        const parsed = parseCyHtml(cy.body, code);
-        html += renderCy(parsed, code);
-      } catch (cyErr) {
-        html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyErr.message)}</p></div>`;
-      }
+  html += `<div class="section-title">ELTA (Greece)</div>`;
+  if (eltaRes.status === 'fulfilled') {
+    try {
+      const parsed = JSON.parse(eltaRes.value.body);
+      const entry = Array.isArray(parsed) ? parsed[0] : parsed;
+      html += renderElta(entry);
+    } catch {
+      html += `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">Could not read ELTA response.</p></div>`;
     }
-  } catch (err) {
-    html += `<p class="error">Request failed: ${esc(err.message)}</p>`;
+  } else {
+    html += `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">ELTA request failed: ${esc(eltaRes.reason?.message || 'unknown error')}</p></div>`;
+  }
+
+  html += `<div class="section-title">Cyprus (CY)</div>`;
+  if (cyRes.status === 'fulfilled') {
+    const parsed = parseCyHtml(cyRes.value.body, code);
+    html += renderCy(parsed, code);
+  } else {
+    html += `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
   }
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
