@@ -452,7 +452,7 @@ function page(value, contentHtml) {
 </html>`;
 }
 
-const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
@@ -526,6 +526,13 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(page(code, html));
-});
+};
 
-server.listen(PORT, () => console.log(`ELTA tracker running at http://localhost:${PORT}`));
+// Vercel (and any other serverless host) imports this module and calls the
+// handler per request. Running the file directly still starts a real server,
+// so `npm start` keeps working locally and on a VPS.
+module.exports = handler;
+
+if (require.main === module) {
+  http.createServer(handler).listen(PORT, () => console.log(`ELTA tracker running at http://localhost:${PORT}`));
+}

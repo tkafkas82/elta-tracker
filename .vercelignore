@@ -1,0 +1,6 @@
+# Local debug artifacts and Windows helpers - not needed in the deployment.
+# Without this, /cyprus_page.html would be reachable as a static file.
+cyprus_page.html
+cy_find.html
+out.log
+*.bat
