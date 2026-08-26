@@ -280,6 +280,20 @@ function eltaFinalStatus(entry) {
   return { delivered, last };
 }
 
+// One place to name each leg, so the "nothing answered" card and the
+// per-carrier cards cannot drift apart, and the all-failed test below stays
+// right if a fourth carrier is ever added.
+const CARRIERS = {
+  elta: { name: 'ELTA', label: 'ELTA (GR)', badge: 'elta' },
+  gt: { name: 'Geniki', label: 'Geniki (GR)', badge: 'gt' },
+  cy: { name: 'CY', label: 'Cyprus (CY)', badge: 'cy' },
+};
+
+// Transport-level failures: the network is the problem, not the tracking code.
+function isNetworkError(reason) {
+  return /ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EPIPE|socket hang up|timed out/i.test(String(reason || ''));
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -503,6 +517,40 @@ function renderGeniki(parsed, code) {
     </details>`;
 }
 
+function renderCarrierError(carrier, text) {
+  return `
+    <div class="card">
+      <div class="card-head"><span class="badge ${carrier.badge}">${esc(carrier.label)}</span></div>
+      <p class="error">${esc(text)}</p>
+    </div>`;
+}
+
+// When every leg failed there is only one thing to say — three DNS errors or
+// three timeouts are the same message repeated — so say it once and keep the
+// per-carrier reasons one click away.
+function renderAllUnreachable(failures, code) {
+  const allNetwork = failures.every((f) => f.network);
+  const rows = failures.map((f) => `
+          <li><span class="badge ${f.badge}">${esc(f.label)}</span> <span class="meta">${esc(f.reason)}</span></li>`).join('');
+
+  return `
+    <div class="card offline">
+      <div class="card-head">
+        <span class="badge warn">No carrier answered</span>
+        <span class="code">${esc(code)}</span>
+      </div>
+      <p class="offline-lead">${allNetwork
+        ? 'None of the carriers could be reached, so this is a connection problem on this side — it says nothing about the code you entered.'
+        : 'None of the carriers returned a usable answer. The code may well be fine; this is worth retrying.'}</p>
+      <p><a class="retry" href="?code=${encodeURIComponent(code)}">Try again</a></p>
+      <details class="offline-detail">
+        <summary>Per-carrier detail</summary>
+        <ul class="offline-list">${rows}
+        </ul>
+      </details>
+    </div>`;
+}
+
 function renderRaw(label, status, body) {
   let pretty = body;
   try { pretty = JSON.stringify(JSON.parse(body), null, 2); } catch {}
@@ -563,6 +611,8 @@ function page(value, contentHtml) {
     [data-theme="dark"] .badge.cy { background:#3b2718; color:#f5b97a; }
     .badge.gt { background:#fde8e8; color:#c0392b; }
     [data-theme="dark"] .badge.gt { background:#3a1c1c; color:#f5a3a3; }
+    .badge.warn { background:#fff4e5; color:#b45309; }
+    [data-theme="dark"] .badge.warn { background:#3a2a10; color:#f3c47c; }
     .badge.done { background:#e6f7ec; color:#12924a; }
     [data-theme="dark"] .badge.done { background:#122e1f; color:#6ee7a5; }
     .timeline { list-style:none; margin:0; padding:0 0 0 .2rem; }
@@ -577,6 +627,15 @@ function page(value, contentHtml) {
     .gt-note { margin-top:.6rem; font-size:.85rem; color:#c0392b; background:#fdecec; padding:.5rem .7rem; border-radius:8px; }
     [data-theme="dark"] .gt-note { background:#3a1c1c; color:#f5a3a3; }
     .gt-foot { margin-top:.7rem; }
+    /* "Nothing answered" card */
+    .offline { border-left:4px solid #b45309; }
+    .offline-lead { margin:0 0 .7rem; }
+    .retry { display:inline-block; color:var(--blue); font-weight:600; text-decoration:none; }
+    .retry:hover { text-decoration:underline; }
+    .offline-detail { margin-top:.6rem; }
+    .offline-detail > summary { cursor:pointer; color:var(--grey); font-size:.85rem; }
+    .offline-list { list-style:none; margin:.6rem 0 0; padding:0; }
+    .offline-list li { display:flex; align-items:center; gap:.5rem; padding:.2rem 0; flex-wrap:wrap; }
     pre { background:var(--pre-bg); padding:.9rem; border-radius:8px; overflow:auto; font-size:.82rem; color:var(--text); }
     .error { color:#c0392b; }
     .section-title { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--grey); margin:1.2rem 0 .3rem; }
@@ -664,10 +723,20 @@ const handler = async (req, res) => {
     fetchCyResults(code),
   ]);
 
-  // Build each carrier section and its latest-status candidate.
+  // Build each carrier section and its latest-status candidate. Every leg that
+  // did not answer is also recorded in `failures` so we can tell a single
+  // carrier being down from the whole network being down.
   let eltaHtml = '', gtHtml = '', cyHtml = '';
   let eltaLatestVal = null, gtLatestVal = null, cyLatestVal = null;
   let gtKnowsCode = false;
+  const failures = [];
+
+  // Records the failure and returns that carrier's own error card, which is
+  // only used when the other legs did answer.
+  const fail = (carrier, reason, text) => {
+    failures.push({ ...carrier, reason, network: isNetworkError(reason) });
+    return renderCarrierError(carrier, text || `${carrier.name} request failed: ${reason}`);
+  };
 
   if (eltaRes.status === 'fulfilled') {
     try {
@@ -676,19 +745,20 @@ const handler = async (req, res) => {
       eltaLatestVal = eltaLatest(entry);
       eltaHtml = renderElta(entry);
     } catch {
-      eltaHtml = `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">Could not read ELTA response.</p></div>`;
+      eltaHtml = fail(CARRIERS.elta, 'unreadable response', 'Could not read ELTA response.');
     }
   } else {
-    eltaHtml = `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">ELTA request failed: ${esc(eltaRes.reason?.message || 'unknown error')}</p></div>`;
+    eltaHtml = fail(CARRIERS.elta, eltaRes.reason?.message || 'unknown error');
   }
 
   if (gtRes.status === 'fulfilled') {
     const parsed = parseGtJson(gtRes.value.body, code);
     gtKnowsCode = !parsed.error && !parsed.notFound;   // Result 0 = real voucher
     gtLatestVal = gtLatest(parsed);
+    if (parsed.error) failures.push({ ...CARRIERS.gt, reason: parsed.error, network: false });
     gtHtml = renderGeniki(parsed, code);
   } else {
-    gtHtml = `<div class="card"><div class="card-head"><span class="badge gt">Geniki (GR)</span></div><p class="error">Geniki request failed: ${esc(gtRes.reason?.message || 'unknown error')}</p></div>`;
+    gtHtml = fail(CARRIERS.gt, gtRes.reason?.message || 'unknown error');
   }
 
   if (cyRes.status === 'fulfilled') {
@@ -696,13 +766,16 @@ const handler = async (req, res) => {
     cyLatestVal = cyLatest(parsed);
     cyHtml = renderCy(parsed, code);
   } else {
-    cyHtml = `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
+    cyHtml = fail(CARRIERS.cy, cyRes.reason?.message || 'unknown error');
   }
 
-  // A voucher Geniki recognises is a Geniki parcel, full stop: ELTA and Cyprus
-  // Post can only ever answer "no information" for it, so drop their sections
-  // rather than showing two empty timelines next to the real one.
-  if (gtKnowsCode) {
+  if (failures.length === Object.keys(CARRIERS).length) {
+    // Nothing answered — one message beats three identical DNS/timeout cards.
+    html += renderAllUnreachable(failures, code);
+  } else if (gtKnowsCode) {
+    // A voucher Geniki recognises is a Geniki parcel, full stop: ELTA and
+    // Cyprus Post can only ever answer "no information" for it, so drop their
+    // sections rather than showing two empty timelines next to the real one.
     html += renderSummary(gtLatestVal);
     html += gtHtml;
   } else {
