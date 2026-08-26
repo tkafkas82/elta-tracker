@@ -588,7 +588,7 @@ function page(value, contentHtml) {
     <h1>ELTA Package Tracker</h1>
     <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle dark mode">🌙</button>
   </div>
-  <p class="sub">Tracks one code against ELTA, Geniki Taxydromiki and Cyprus Post at once — whichever carrier knows it answers, the others report no information.</p>
+  <p class="sub">Tracks one code against ELTA, Geniki Taxydromiki and Cyprus Post at once. A Geniki voucher is shown on its own; anything else lists the ELTA and Cyprus Post legs together.</p>
   <form method="get">
     <input name="code" placeholder="Tracking code or voucher (e.g. RE574578316GR, 5177779390)" value="${esc(value)}">
     <button type="submit">Track</button>
@@ -651,10 +651,12 @@ const handler = async (req, res) => {
     return;
   }
 
-  // Query every carrier in parallel and always show all of them. A parcel to
-  // Cyprus is tracked by ELTA inside Greece and by Cyprus Post once it
-  // arrives; Geniki is a separate courier altogether. A carrier that does not
-  // know the code just reports "no information", which is fine.
+  // Query every carrier in parallel — we cannot tell from the code alone which
+  // one owns it, and Geniki (the slow leg) would gate the others if we chained
+  // them. A parcel to Cyprus is tracked by ELTA inside Greece and by Cyprus
+  // Post once it arrives, so those two legs belong together; Geniki is a
+  // separate courier altogether and its vouchers are never known to the
+  // others, so a Geniki hit is rendered on its own (see gtKnowsCode below).
   let html = '';
   const [eltaRes, gtRes, cyRes] = await Promise.allSettled([
     trackWithElta(code),
@@ -665,6 +667,7 @@ const handler = async (req, res) => {
   // Build each carrier section and its latest-status candidate.
   let eltaHtml = '', gtHtml = '', cyHtml = '';
   let eltaLatestVal = null, gtLatestVal = null, cyLatestVal = null;
+  let gtKnowsCode = false;
 
   if (eltaRes.status === 'fulfilled') {
     try {
@@ -681,6 +684,7 @@ const handler = async (req, res) => {
 
   if (gtRes.status === 'fulfilled') {
     const parsed = parseGtJson(gtRes.value.body, code);
+    gtKnowsCode = !parsed.error && !parsed.notFound;   // Result 0 = real voucher
     gtLatestVal = gtLatest(parsed);
     gtHtml = renderGeniki(parsed, code);
   } else {
@@ -695,10 +699,18 @@ const handler = async (req, res) => {
     cyHtml = `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
   }
 
-  html += renderSummary(pickLatest(eltaLatestVal, gtLatestVal, cyLatestVal));
-  html += eltaHtml;
-  html += gtHtml;
-  html += cyHtml;
+  // A voucher Geniki recognises is a Geniki parcel, full stop: ELTA and Cyprus
+  // Post can only ever answer "no information" for it, so drop their sections
+  // rather than showing two empty timelines next to the real one.
+  if (gtKnowsCode) {
+    html += renderSummary(gtLatestVal);
+    html += gtHtml;
+  } else {
+    html += renderSummary(pickLatest(eltaLatestVal, gtLatestVal, cyLatestVal));
+    html += eltaHtml;
+    html += gtHtml;
+    html += cyHtml;
+  }
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(page(code, html));
