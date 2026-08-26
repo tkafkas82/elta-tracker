@@ -18,6 +18,14 @@ const CY_RESULTS_URL = process.env.CY_RESULTS_URL || '';
 const CY_TRACK_PAGE = 'https://www.cypruspost.post/en/track-n-trace-results';
 const CY_FIND_URL = 'https://www.cypruspost.post/track-and-trace/find';
 
+// Geniki Taxydromiki (GT) service.
+// Their track page posts a JSON body to a PHP endpoint that fronts the
+// TrackAndTrace backend. Quirk worth keeping: the body is JSON but the request
+// is declared as x-www-form-urlencoded, so we reproduce that verbatim.
+// Result 0 = voucher found, 9 = unknown voucher (any non-GT code lands there).
+const GT_TRACK_API = 'https://taxydromiki.com/external_scripts/track-site.php';
+const GT_LANG = 'el';   // matches the Greek statuses ELTA returns
+
 const CY_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml',
@@ -53,6 +61,37 @@ function postForm(apiUrl, fields) {
 
 function trackWithElta(code) {
   return postForm(TRACK_API, { 'code[]': code, in_lang: '1' });
+}
+
+// Geniki lookup. Note the deliberate JSON-body / form-urlencoded mismatch.
+function trackWithGeniki(code) {
+  const payload = JSON.stringify({ lang: GT_LANG, voucherNo: code });
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(payload),
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+      'Origin': 'https://taxydromiki.com',
+      'Referer': 'https://taxydromiki.com/track/',
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(GT_TRACK_API, options, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    // The Geniki backend is genuinely slow: 9-15s is normal, so keep this
+    // generous (but under the 30s serverless ceiling in vercel.json).
+    req.setTimeout(25000, () => { req.destroy(); reject(new Error('Geniki request timed out')); });
+    req.write(payload);
+    req.end();
+  });
 }
 
 function httpGet(url, cookie) {
@@ -175,6 +214,42 @@ function parseCyHtml(html, code) {
   return { service, events, noInfo: false };
 }
 
+// Parse the Geniki JSON. The payload is keyed by the voucher number, and the
+// checkpoint list collapses to a bare object when there is only one event.
+function parseGtJson(body, code) {
+  let json;
+  try { json = JSON.parse(body); } catch { return { error: 'Could not read Geniki response.' }; }
+
+  const result = json && json[code] && json[code].TrackAndTraceResult;
+  if (!result) return { error: 'Geniki returned no result for this code.' };
+  if (Number(result.Result) !== 0) return { notFound: true, events: [] };
+
+  const raw = result.Checkpoints && result.Checkpoints.Checkpoint;
+  const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+
+  const events = list
+    .map((c, i) => ({
+      status: c.Status || '',
+      statusCode: c.StatusCode || '',
+      when: formatIso(c.StatusDate),
+      where: c.Shop || '',
+      key: isoKey(c.StatusDate),
+      i,
+    }))
+    .sort((a, b) => (a.key === b.key ? a.i - b.i : a.key < b.key ? -1 : 1));
+
+  return {
+    events,
+    status: result.Status || '',
+    consignee: result.Consignee || '',
+    deliveredAt: result.DeliveredAt || '',
+    // Only a real delivery stamps a date; pending comes back as 1900-01-01.
+    // The Status text is no use here ("ΠΡΟΣ ΠΑΡΑΔΟΣΗ" contains "παραδο").
+    deliveryDate: hasRealDate(result.DeliveryDate) ? formatIso(result.DeliveryDate) : '',
+    delivered: hasRealDate(result.DeliveryDate),
+  };
+}
+
 // Lowercase + strip Greek accents so matching is tolerant of casing/tonos.
 function norm(s) {
   return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
@@ -220,6 +295,23 @@ function formatDateTime(date, time) {
   return `${d}/${m}/${y}${t}`.trim();
 }
 
+// Geniki timestamps are ISO-ish local strings ("2026-08-26T13:03:48").
+function formatIso(iso) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return '';
+  return `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}`;
+}
+
+function isoKey(iso) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  return m ? m[1] + m[2] + m[3] + m[4] + m[5] : '';
+}
+
+// Placeholder stamps (0001-01-01 / 1900-01-01) mean "not delivered yet".
+function hasRealDate(iso) {
+  return Number(String(iso || '').slice(0, 4)) > 1900;
+}
+
 // --- Latest-known-status helpers (used for the top summary banner) ---
 
 // Normalise a CY "DD/MM/YYYY HH:MM" stamp to a sortable YYYYMMDDHHMM key.
@@ -254,13 +346,28 @@ function cyLatest(parsed) {
   };
 }
 
-function pickLatest(a, b) {
-  if (!a) return b || null;
-  if (!b) return a;
-  if (b.key !== a.key) return b.key > a.key ? b : a; // more recent timestamp wins
-  // Same timestamp (e.g. the shared Athens airport handoff): prefer the CY
-  // leg — it is the more advanced, downstream status.
-  return b.source === 'CY' ? b : a.source === 'CY' ? a : b;
+function gtLatest(parsed) {
+  if (!parsed || parsed.error || parsed.notFound || !parsed.events.length) return null;
+  const e = parsed.events[parsed.events.length - 1];
+  return {
+    source: 'GT', label: 'Geniki (GR)', badge: 'gt',
+    status: e.status || parsed.status || '—',
+    where: e.where || '',
+    when: e.when || '',
+    key: e.key,
+  };
+}
+
+// Only used to break exact-timestamp ties: the downstream leg wins (e.g. the
+// shared Athens airport handoff shows up on both the GR and the CY side).
+const SOURCE_RANK = { ELTA: 0, GT: 0, CY: 1 };
+
+function pickLatest(...candidates) {
+  return candidates.filter(Boolean).reduce((best, c) => {
+    if (!best) return c;
+    if (c.key !== best.key) return c.key > best.key ? c : best;
+    return (SOURCE_RANK[c.source] || 0) > (SOURCE_RANK[best.source] || 0) ? c : best;
+  }, null);
 }
 
 function renderSummary(latest) {
@@ -344,6 +451,58 @@ function renderCy(parsed, code) {
     </details>`;
 }
 
+function renderGeniki(parsed, code) {
+  if (parsed.error) {
+    return `
+    <div class="card">
+      <div class="card-head"><span class="badge gt">Geniki (GR)</span></div>
+      <p class="error">${esc(parsed.error)}</p>
+    </div>`;
+  }
+
+  const hasEvents = !parsed.notFound && parsed.events.length > 0;
+  const hint = parsed.notFound
+    ? 'Unknown voucher'
+    : (hasEvents ? parsed.events[parsed.events.length - 1].status : 'No events listed');
+
+  let body;
+  if (parsed.notFound) {
+    body = '<div class="gt-note">Geniki Taxydromiki does not know this number — it is either not a Geniki voucher or has not been registered yet.</div>';
+  } else {
+    const rows = parsed.events.map((e, i) => {
+      const meta = [e.where, e.when].filter(Boolean).map(esc).join(' · ');
+      return `
+      <li class="${i === parsed.events.length - 1 ? 'current' : ''}">
+        <div class="dot"></div>
+        <div class="ev">
+          <div class="status">${esc(e.status || '—')}</div>
+          ${meta ? `<div class="meta">${meta}</div>` : ''}
+        </div>
+      </li>`;
+    }).join('');
+    const foot = [
+      parsed.consignee ? `Consignee: ${esc(parsed.consignee)}` : '',
+      parsed.deliveredAt ? `Delivered at: ${esc(parsed.deliveredAt)}` : '',
+      parsed.deliveryDate ? `Delivery date: ${esc(parsed.deliveryDate)}` : '',
+    ].filter(Boolean).join(' · ');
+    body = (rows ? `<ol class="timeline">${rows}</ol>` : '<div class="gt-note">No tracking events listed.</div>')
+      + (foot ? `<div class="gt-foot meta">${foot}</div>` : '');
+  }
+
+  return `
+    <details class="card section" ${hasEvents ? 'open' : ''}>
+      <summary class="card-head">
+        <span class="chev">▸</span>
+        <span class="badge gt">Geniki (GR)</span>
+        <span class="code">${esc(code)}</span>
+        ${parsed.delivered ? '<span class="badge done">Delivered</span>' : ''}
+        ${!parsed.notFound && parsed.status ? `<span class="service">${esc(parsed.status)}</span>` : ''}
+        <span class="summary-hint">${esc(hint)}</span>
+      </summary>
+      ${body}
+    </details>`;
+}
+
 function renderRaw(label, status, body) {
   let pretty = body;
   try { pretty = JSON.stringify(JSON.parse(body), null, 2); } catch {}
@@ -402,6 +561,8 @@ function page(value, contentHtml) {
     [data-theme="dark"] .badge.elta { background:#0f1f40; color:#93bfff; }
     .badge.cy { background:#fff0e6; color:#d97706; }
     [data-theme="dark"] .badge.cy { background:#3b2718; color:#f5b97a; }
+    .badge.gt { background:#fde8e8; color:#c0392b; }
+    [data-theme="dark"] .badge.gt { background:#3a1c1c; color:#f5a3a3; }
     .badge.done { background:#e6f7ec; color:#12924a; }
     [data-theme="dark"] .badge.done { background:#122e1f; color:#6ee7a5; }
     .timeline { list-style:none; margin:0; padding:0 0 0 .2rem; }
@@ -413,6 +574,9 @@ function page(value, contentHtml) {
     .timeline .meta { color:var(--grey); font-size:.85rem; margin-top:.1rem; }
     .cy-note { margin-top:.6rem; font-size:.85rem; color:#d97706; background:#fff7ed; padding:.5rem .7rem; border-radius:8px; }
     [data-theme="dark"] .cy-note { background:#3b2718; color:#f5b97a; }
+    .gt-note { margin-top:.6rem; font-size:.85rem; color:#c0392b; background:#fdecec; padding:.5rem .7rem; border-radius:8px; }
+    [data-theme="dark"] .gt-note { background:#3a1c1c; color:#f5a3a3; }
+    .gt-foot { margin-top:.7rem; }
     pre { background:var(--pre-bg); padding:.9rem; border-radius:8px; overflow:auto; font-size:.82rem; color:var(--text); }
     .error { color:#c0392b; }
     .section-title { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--grey); margin:1.2rem 0 .3rem; }
@@ -424,9 +588,9 @@ function page(value, contentHtml) {
     <h1>ELTA Package Tracker</h1>
     <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle dark mode">🌙</button>
   </div>
-  <p class="sub">Track Greek parcels via ELTA. When delivered in Greece, continue with the Cyprus (CY) service.</p>
+  <p class="sub">Tracks one code against ELTA, Geniki Taxydromiki and Cyprus Post at once — whichever carrier knows it answers, the others report no information.</p>
   <form method="get">
-    <input name="code" placeholder="Tracking code (e.g. RE574578316GR)" value="${esc(value)}">
+    <input name="code" placeholder="Tracking code or voucher (e.g. RE574578316GR, 5177779390)" value="${esc(value)}">
     <button type="submit">Track</button>
   </form>
   ${contentHtml}
@@ -487,17 +651,20 @@ const handler = async (req, res) => {
     return;
   }
 
-  // Query both carriers in parallel and always show both. A parcel to Cyprus
-  // is tracked by ELTA inside Greece and by Cyprus Post once it arrives; for
-  // anything else the CY side simply reports "no information", which is fine.
+  // Query every carrier in parallel and always show all of them. A parcel to
+  // Cyprus is tracked by ELTA inside Greece and by Cyprus Post once it
+  // arrives; Geniki is a separate courier altogether. A carrier that does not
+  // know the code just reports "no information", which is fine.
   let html = '';
-  const [eltaRes, cyRes] = await Promise.allSettled([
+  const [eltaRes, gtRes, cyRes] = await Promise.allSettled([
     trackWithElta(code),
+    trackWithGeniki(code),
     fetchCyResults(code),
   ]);
 
   // Build each carrier section and its latest-status candidate.
-  let eltaHtml = '', cyHtml = '', eltaLatestVal = null, cyLatestVal = null;
+  let eltaHtml = '', gtHtml = '', cyHtml = '';
+  let eltaLatestVal = null, gtLatestVal = null, cyLatestVal = null;
 
   if (eltaRes.status === 'fulfilled') {
     try {
@@ -512,6 +679,14 @@ const handler = async (req, res) => {
     eltaHtml = `<div class="card"><div class="card-head"><span class="badge elta">ELTA (GR)</span></div><p class="error">ELTA request failed: ${esc(eltaRes.reason?.message || 'unknown error')}</p></div>`;
   }
 
+  if (gtRes.status === 'fulfilled') {
+    const parsed = parseGtJson(gtRes.value.body, code);
+    gtLatestVal = gtLatest(parsed);
+    gtHtml = renderGeniki(parsed, code);
+  } else {
+    gtHtml = `<div class="card"><div class="card-head"><span class="badge gt">Geniki (GR)</span></div><p class="error">Geniki request failed: ${esc(gtRes.reason?.message || 'unknown error')}</p></div>`;
+  }
+
   if (cyRes.status === 'fulfilled') {
     const parsed = parseCyHtml(cyRes.value.body, code);
     cyLatestVal = cyLatest(parsed);
@@ -520,8 +695,9 @@ const handler = async (req, res) => {
     cyHtml = `<div class="card"><div class="card-head"><span class="badge cy">Cyprus (CY)</span></div><p class="error">CY request failed: ${esc(cyRes.reason?.message || 'unknown error')}</p></div>`;
   }
 
-  html += renderSummary(pickLatest(eltaLatestVal, cyLatestVal));
+  html += renderSummary(pickLatest(eltaLatestVal, gtLatestVal, cyLatestVal));
   html += eltaHtml;
+  html += gtHtml;
   html += cyHtml;
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
