@@ -519,12 +519,12 @@ function page(value, contentHtml) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ELTA Tracker</title>
+  <title>Parcel Tracker</title>
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#0a6cff">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="apple-mobile-web-app-title" content="ELTA Tracker">
+  <meta name="apple-mobile-web-app-title" content="Parcel Tracker">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230a6cff' rx='20'/><path d='M20 40 L50 65 L80 40' fill='none' stroke='white' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'/><rect x='20' y='40' width='60' height='45' fill='none' stroke='white' stroke-width='8'/></svg>" type="image/svg+xml">
   <style>
     :root { --blue:#0a6cff; --grey:#666; --line:#e3e3e3; --bg:#fff; --card-bg:#fff; --text:#1c1c1c; --input-bg:#fff; --input-border:#ccc; --pre-bg:#f6f6f6; }
@@ -585,7 +585,7 @@ function page(value, contentHtml) {
 </head>
 <body>
   <div style="display:flex;align-items:center;gap:.5rem;">
-    <h1>ELTA Package Tracker</h1>
+    <h1>Parcel Tracker</h1>
     <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle dark mode">🌙</button>
   </div>
   <p class="sub">Tracks one code against ELTA, Geniki Taxydromiki and Cyprus Post at once. A Geniki voucher is shown on its own; anything else lists the ELTA and Cyprus Post legs together.</p>
@@ -623,8 +623,8 @@ const handler = async (req, res) => {
   if (pathname === '/manifest.json') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      name: 'ELTA Package Tracker',
-      short_name: 'ELTA Tracker',
+      name: 'Parcel Tracker',
+      short_name: 'Parcel Tracker',
       start_url: '/',
       display: 'standalone',
       background_color: '#0f1115',
@@ -722,5 +722,5 @@ const handler = async (req, res) => {
 module.exports = handler;
 
 if (require.main === module) {
-  http.createServer(handler).listen(PORT, () => console.log(`ELTA tracker running at http://localhost:${PORT}`));
+  http.createServer(handler).listen(PORT, () => console.log(`Parcel tracker running at http://localhost:${PORT}`));
 }

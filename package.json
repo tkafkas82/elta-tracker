@@ -1,7 +1,7 @@
 {
   "name": "elta-tracker",
   "version": "1.0.0",
-  "description": "Posts tracking codes to ELTA trackApi and presents the response",
+  "description": "Tracks one parcel code against ELTA, Geniki Taxydromiki and Cyprus Post at once",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
